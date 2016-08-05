@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# This program is free software; you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation; either version 3 of the License, or (at your option) any later version. 
+# This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the   GNU General Public License for more details.
+# You should have received a copy of the GNU General Public License   along with this program; if not, got to https://www.gnu.org/licenses/gpl-3.0.txt or write to the Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
+# copyright (c) 2016, Stephan Fuchs, fuchss@rki.de 
+
+#config
+version = '1.0.0.0'
+betaversion=True
+logsep = '=====================================\n'
+author = 'Stephan Fuchs (fuchss@rki.de)'
+a5_cmds = ['a5_pipeline.pl', 'a5_pipeline']
+
+#dependencies
+try:
+    import argparse
+except ImportError:
+    print('The "argparse" module is not available. Use Python 3.2 or better.')
+    sys.exit(1)
+    
+import os
+import re
+import sys
+import gzip
+import time
+import shutil
+import traceback
+import subprocess
+import multiprocessing
+
+
+#processing command line arguments
+parser = argparse.ArgumentParser(prog=os.path.basename(__file__), description='parallelized batch a5 assembly of paired-end read data')
+parser.add_argument('file', metavar="FILE", help="input fastq file(s)", type=argparse.FileType('r'), nargs='+')
+parser.add_argument('-i', help="if set paired-end read data is provided in a single file (interleaved FASTQ). By default, two files containing forward and reverse reads, respectively, are expected.",  action="store_true")
+parser.add_argument('-p', metavar='INT', help="Number of subprocesses that should be run in parallel. Default is 2." , type=int, action="store", default=2)
+parser.add_argument('-t', metavar='INT', help="Number of threads/CPUs that should be assigned to each subprocess. Default is 2." , type=int, action="store", default=2)
+parser.add_argument('--version', action='version', version='%(prog)s ' + version)
+args = parser.parse_args()
+
+ 
+#FUNCTIONS
+def init(l, q, s, f,w, ):
+	global lock, queue, succeeded, failed, workers
+	lock = l	
+	queue = q
+	succeeded = s
+	failed = f
+	workers = w
+	
+def die(msg=False, path = False, status=1):
+	'''Displays message (optional) and exits using the defined status code. If a path is given, this path is deleted (recursively)'''
+	if msg:
+		print(msg)
+	if path:
+		shutil.rmtree(path)
+		sys.exit(status)
+		
+def which(program):
+    import os
+    def is_exe(fpath):
+        return os.path.isfile(fpath) and os.access(fpath, os.X_OK)
+
+    fpath, fname = os.path.split(program)
+    if fpath:
+        if is_exe(program):
+            return program
+    else:
+        for path in os.environ["PATH"].split(os.pathsep):
+            path = path.strip('"')
+            exe_file = os.path.join(path, program)
+            if is_exe(exe_file):
+                return exe_file
+
+    return None		
+    
+def formatColumns(rows, empty='', space=5):
+	'''formats nested list (1. level = rows; 2. level = columns) in equal-sized columns. fields containing integers or floats are aligned to the right''' 
+	
+	#allowed signs in numbers
+	allowed = ['+', '-', '.', ',', '%']
+	
+	#str conversion
+	rows = [[str(x) for x in row] for row in rows] 
+	
+	#fill up rows to same number of columns (important for transposing)
+	maxlen = max([len(x) for x in rows])
+	[x.extend([empty]*(maxlen-len(x))) for x in rows]    
+	align = []
+	output = [''] * len(rows)
+	for column in zip(*rows):
+		#detect numbers to align right
+		string = ''.join(column)
+		for i in allowed:
+			string = string.replace(i, '')
+		if string.strip('+-.,').isdigit():
+			align = 'r'
+		else:
+			align = 'l'
+      
+		maxlen = max([len(x) for x in column])    
+		for i in range(len(column)):
+			if align == 'r':
+				output[i] += ' ' * (maxlen - len(column[i])) + column[i] + ' ' * space
+			else:
+				output[i] += column[i] + ' ' * (maxlen - len(column[i])) + ' ' * space    
+
+	return '\n'.join(output) + '\n'    
+
+def getA5Version(a5_cmd):    
+	cli=a5_cmd + " 2>&1 |tee | grep version | sed 's/^.*version *//'"
+	proc=subprocess.Popen(cli, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)   
+	
+	out, err=proc.communicate()  
+    
+	return out.decode()
+
+def assemble(jobdata):
+	with workers.get_lock():
+			workers.value += 1
+			
+	file1, file2, targetpath, t, a5_cmd = jobdata
+	absfile1 = os.path.abspath(file1)
+	
+	if file2:
+		absfile2 = os.path.abspath(file2)
+		outbase = os.path.commonprefix([os.path.basename(file1), os.path.basename(file2)])
+		cli = [a5_cmd, '-threads', str(t), absfile1, absfile2, outbase+'_assembly']
+	else:
+		base = os.path.basename(file1)
+		outbase = os.path.splitext(base)[0]
+		cli = [a5_cmd, '-threads', str(t), absfile1, outbase+'_assembly/']
+	outbase = outbase.strip(' ._-()')
+	
+	outdir=targetpath + "/" + outbase 
+	os.mkdir(outdir)
+	
+	stdoutf = outdir + "/stdout.log"
+	stderrf = outdir + "/stderr.log"
+	
+	with open(stdoutf, 'w') as outfile, open(stderrf, 'w') as errfile:	
+		proc = subprocess.Popen(cli, shell=False, stdout=outfile, stderr=errfile, cwd=outdir)
+	
+	proc.wait()
+	queue.put((file1, file2, proc.returncode, outbase, stdoutf, stderrf))
+	
+	if proc.returncode > 0:
+		with failed.get_lock():
+			failed.value += 1		
+	else:
+		with succeeded.get_lock():
+			succeeded.value += 1
+			
+	with workers.get_lock():
+		workers.value -= 1
+	
+	queue.task_done()
+		
+	
+	
+#START    
+if __name__ == '__main__':
+    #check a5
+	for a5_cmd in a5_cmds:
+		if which(a5_cmd) is not None:
+			break
+	if a5_cmd is None:
+		print("could not find a5 assembler, please install.")
+		exit(1)
+	
+	
+	#check input files
+	files = []
+	for f in args.file:
+		files.append(f.name)
+		f.close()    
+	files.sort()
+	if args.i == False and len(files) % 2 != 0:
+		print("ERROR: number of submitted files must be even or use paramter -i to submit interleaved FASTQ files")
+		exit(1)
+
+	#create dir
+	err = 1
+	while err > 0:
+		timecode = time.strftime("%Y-%m-%d_%H-%M-%S")
+		targetpath = "BATCHASSEMBLY_" + timecode
+		if os.path.isdir(targetpath):
+			err += 1
+			time.sleep(1)
+		else:
+			os.mkdir(targetpath)
+			err = 0
+		if err == 30:
+			print("ERROR: giving up to find available output file name")
+			sys.exit(1)      
+	print("target path created:  " + targetpath)	
+	
+	#creat jobdata
+	print("preparing assembly job(s)...")
+	jobdata=[]	
+	if args.i == False:
+		i = 0	
+		while i*2 < len(files):
+			file1=files[i*2]
+			file2=files[i*2+1]
+			jobdata.append([file1, file2, targetpath, args.t, a5_cmd])  
+			i+= 1
+	else:
+		i = 0	
+		while i < len(files):
+			file=files[i]
+			jobdata.append([file, False, targetpath, args.t, a5_cmd])  
+			i+= 1		
+	
+	if len(jobdata) <= args.p:
+		args.p = len(jobdata)
+	
+	s = multiprocessing.Value('i', 0) #succeeded jobs
+	f = multiprocessing.Value('i', 0) # failed jobs
+	w = multiprocessing.Value('i', 0) # workers
+	l = multiprocessing.Lock()
+	m = multiprocessing.Manager()
+	q = m.Queue()
+	p = multiprocessing.Pool(processes=args.p, initializer=init, initargs=(l,q,s,f,w, ))
+	rs = p.map_async(assemble, jobdata)
+	
+	size = -1
+	worker = 0
+	change = False
+	while (True):
+		if q.qsize() != size:
+			change = True
+			size = q.qsize()
+		if w.value != worker:
+			change = True
+			worker = w.value			
+		if change:
+			change = False
+			print ("\rworking on " + str(worker) + " assembly job(s)...  [" + str(size) + " of " + str(len(jobdata)) + " done] [" + str(s.value) + " successfully completed]                   ", end = " ")
+		if (rs.ready()):
+			break		
+		time.sleep(1)
+		
+	print ("\rworking on " + str(worker) + " assembly job(s)...  [" + str(size) + " of " + str(len(jobdata)) + " done] [" + str(s.value) + " successfully completed]                   ", end = " ")
+	print()
+	q.join()
+	p.close()
+	p.join()   
+	
+	failed_tasks = []
+	succeeded_tasks = []
+	while q.qsize():
+		item = q.get()
+		if item[2] == 0:
+			succeeded_tasks.append(item)
+		else:
+			failed_tasks.append(item)
+	
+	#logging
+	print ("writing log file...")
+	
+	#GENERAL
+	loghandle=open(targetpath+"/"+"batchAssemby.log", "w")
+	loghandle.write("BATCH ASSEMBLY\n")
+	loghandle.write(logsep)
+	output=[["version:", version],  ["creation time:", timecode]]
+	loghandle.write(formatColumns(output))
+	
+	loghandle.write("\nA5\n")
+	loghandle.write(logsep)
+	output=[["version:", getA5Version(a5_cmd)]]
+	loghandle.write(formatColumns(output))
+	
+	#SUCCEEDED TASKS
+	if len(succeeded_tasks):
+		loghandle.write("\nSUCCEEDED JOBS\n")
+		loghandle.write(logsep)
+		if args.i==False:
+			output=[["forward read file", "reverse read file", "result folder"]]
+		else:
+			output=[["read file", "result folder"]]
+		for task in succeeded_tasks:
+			output.append([task[0]])
+			if args.i==False:
+				output[-1].append(task[1])
+			output[-1].append(task[3])
+		loghandle.write(formatColumns(output)) 		
+	
+	#FAILED TASKS
+	if len(failed_tasks):
+		loghandle.write("\nFAILED JOBS\n")
+		loghandle.write(logsep)
+		loghandle.write("see stdout.log and stderr.log in the respective result folders for more information on occured errors\n")
+		if args.i==False:
+			output=[["forward read file", "reverse read file", "error code", "result folder"]]
+		else:
+			output=[["read file", "error code", "result folder"]]
+		for task in failed_tasks:
+			output.append([task[0]])
+			if args.i==False:
+				output[-1].append(task[1])
+			output[-1].append(task[2])	
+			output[-1].append(task[3])	
+		loghandle.write(formatColumns(output)) 
+	
+	#display
+	print(len(succeeded_tasks), "of", len(jobdata), "jobs successfully completed")
+	if len(failed_tasks) > 0:
+		print(len(failed_tasks), "tasks failed :-(")
+		print("for more information on abnormal termination see the log file.")
+	
+	
+	
+      
